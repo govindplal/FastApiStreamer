@@ -33,14 +33,14 @@ class AgentRequest(BaseModel):
     prompt: str
 
 @router.post("/run")
-async def run_agent(request: AgentRequest, db:AsyncSession = Depends(get_db)):
+async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
 
     db_session = Session(task=request.prompt)
     db.add(db_session)
     await db.commit()
-    await db.refresh(db_session) # This pulls the auto-generated ID back from Postgres
+    await db.refresh(db_session)
 
-    # 2. Log the initial user message
+    # Log the initial user message
     db_msg = Message(
         session_id=db_session.id,
         role="user",
@@ -52,7 +52,6 @@ async def run_agent(request: AgentRequest, db:AsyncSession = Depends(get_db)):
     logger.info(f"Starting ReAct loop for task: {request.prompt}")
 
     async def agent_stream_generator():
-
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": request.prompt}
@@ -85,7 +84,7 @@ async def run_agent(request: AgentRequest, db:AsyncSession = Depends(get_db)):
 
                 delta = chunk.choices[0].delta
 
-                #Accumulate text and stream it instantly
+                # Accumulate text and stream it instantly
                 content = delta.content or delta.refusal
                 if content:
                     accumulated_content += content
@@ -98,21 +97,19 @@ async def run_agent(request: AgentRequest, db:AsyncSession = Depends(get_db)):
                         if idx not in accumulated_tool_calls:
                             accumulated_tool_calls[idx] = {
                                 "id": tc_chunk.id,
-            if delta.tool_calls:
-                for tc_chunk in delta.tool_calls:
-                    if tc_chunk.function:
-                        idx = tc_chunk.index
-                        if idx not in accumulated_tool_calls:
-                            accumulated_tool_calls[idx] = {
-                                "id": tc_chunk.id,
                                 "name": tc_chunk.function.name or "",
                                 "arguments": tc_chunk.function.arguments or ""
                             }
                         else:
-                            if tc_chunk.function.name:
+                            if tc_chunk.function and tc_chunk.function.name:
                                 accumulated_tool_calls[idx]["name"] += tc_chunk.function.name
-                            if tc_chunk.function.arguments:
+                            if tc_chunk.function and tc_chunk.function.arguments:
                                 accumulated_tool_calls[idx]["arguments"] += tc_chunk.function.arguments
+
+            # Format tool calls for the message history
+            assistant_message = {"role": "assistant", "content": accumulated_content}
+            if accumulated_tool_calls:
+                formatted_tool_calls = []
                 for idx, tc in accumulated_tool_calls.items():
                     formatted_tool_calls.append({
                         "id": tc["id"],
@@ -127,7 +124,6 @@ async def run_agent(request: AgentRequest, db:AsyncSession = Depends(get_db)):
             messages.append(assistant_message)
 
             if accumulated_tool_calls:
-
                 for idx, tool_data in accumulated_tool_calls.items():
                     tool_name = tool_data["name"]
                     try:
@@ -167,7 +163,6 @@ async def run_agent(request: AgentRequest, db:AsyncSession = Depends(get_db)):
                             
                             tool_result_str = await dispatch_tool(tool_name, parsed_arguments)
                             
-                            # Log to DB
                             db_tool = ToolCall(session_id=db_session.id, tool_name=tool_name, tool_input=parsed_arguments, tool_result={"output": tool_result_str})
                             db.add(db_tool)
                             db_tool_msg = Message(session_id=db_session.id, role="tool", content=f"Tool {tool_name} returned: {tool_result_str}")
