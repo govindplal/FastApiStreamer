@@ -1,4 +1,5 @@
 import json
+import re
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -14,6 +15,17 @@ from core.llm import client
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.database import get_db
 from models.db import Session, Message, ToolCall
+
+SYSTEM_PROMPT = """You are Aperture, an autonomous AI agent.
+You operate using a strict Think -> Act -> Observe loop.
+
+1. First, THINK through what you need to do based on the user's request. Keep your thinking concise.
+2. If you need external data or capabilities, ACT by calling a tool. 
+3. You will receive an OBSERVATION (the tool's result).
+4. Repeat this Think -> Act -> Observe cycle until you have enough information to fulfill the request.
+
+When the task is complete, do not call any more tools. Provide your final response directly to the user explicitly.
+"""
 
 router = APIRouter(prefix="/agent", tags=["Agent Operations"])
 
@@ -37,151 +49,133 @@ async def run_agent(request: AgentRequest, db:AsyncSession = Depends(get_db)):
     db.add(db_msg)
     await db.commit()
 
-    logger.info(f"Received task: {request.prompt}")
+    logger.info(f"Starting ReAct loop for task: {request.prompt}")
 
     async def agent_stream_generator():
 
         messages = [
-            {"role": "system", "content": "You are a helpful assistant. ONLY use tools if explicitly required by the user's prompt. Otherwise, answer from your own knowledge."},
+            {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": request.prompt}
         ]
 
-        response = await client.chat.completions.create(
-            model=settings.LLM_MODEL_NAME,
-            messages=messages,
-            tools=AGENT_TOOLS,
-            tool_choice="auto"
-        )
-        
-        response_message = response.choices[0].message
-        
-        # FLOW BRANCH A: Standard API tool call
-        if response_message.tool_calls:
-            logger.info("Tool call detected. Executing and re-feeding...")
+        # Format data for Server Sent Events (SSE)
+        def sse_event(event_type: str, content: any):
+            payload = json.dumps({"type": event_type, "content": content})
+            return f"data: {payload}\n\n"
 
+        max_iterations = 10
+        for iteration in range(max_iterations):
+            logger.info(f"--- Loop Iteration {iteration + 1} ---")
+
+            response = await client.chat.completions.create(
+                model=settings.LLM_MODEL_NAME,
+                messages=messages,
+                tools=AGENT_TOOLS,
+                tool_choice="auto"
+            )
+
+            response_message = response.choices[0].message
             messages.append(response_message)
-            execution_results = []
-            
-            for tool_call in response_message.tool_calls:
-                tool_name = tool_call.function.name
-                
-                try:
-                    parsed_arguments = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError:
-                    parsed_arguments = {}
-                
-                tool_output = await dispatch_tool(tool_name, parsed_arguments)
 
-                db_tool_call = ToolCall(
-                    session_id=db_session.id,
-                    tool_name=tool_name,
-                    tool_input=parsed_arguments,
-                    tool_result={"output": tool_output},
-                )
-                db.add(db_tool_call)
-                await db.commit()
+            if response_message.content:
+                if not response_message.tool_calls:
 
-                db_tool_msg = Message(
-                    session_id=db_session.id,
-                    role="system", # Or 'tool', depending on how you format it for the LLM
-                    content=f"Tool {tool_name} returned: {tool_output}"
-                )
-                db.add(db_tool_msg)
-                await db.commit()
+                    #Rogue JSON Trap
+                    try:
+                       json_match = re.search(r'\{.*\}', response_message.content, re.DOTALL)
 
-                
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "name": tool_name,
-                    "content": str(tool_output)
-                })
+                       if json_match:
+                        possible_tool_call = json.loads(response_message.content)
 
+                        if isinstance(possible_tool_call, dict) and "name" in possible_tool_call and "arguments" in possible_tool_call:
+                            tool_name = possible_tool_call["name"]
+                            parsed_arguments = possible_tool_call["arguments"]
 
-                final_response = await client.chat.completions.create(
-                    model=settings.LLM_MODEL_NAME,
-                    messages=messages,
-                    stream=True
-                )
+                            logger.info(f"Caught rogue JSON tool call: {tool_name}")
 
-                final_accumulated_text = ""
-                async for chunk in final_response:
-                    if chunk.choices[0].delta.content:
-                        content = chunk.choices[0].delta.content
-                        final_accumulated_text += content
-                        yield content
+                            yield sse_event("tool_call", {"name": tool_name, "arguments": parsed_arguments})
 
-                db_assistant_msg = Message(
-                    session_id=db_session.id,
-                    role="assistant",
-                    content=final_accumulated_text
-                )
-                db.add(db_assistant_msg)
-            
-                db_session.status = "complete"
-                await db.commit()
-                return
-            
-        # FLOW BRANCH B: Handling text or rogue JSON
-        else:
-            text_content = response_message.content if response_message.content else ""
-            
-            # THE TRAP: Check if the text is actually a JSON tool call
-            try:
-                possible_tool_call = json.loads(text_content)
-                
-                # Check if it matches the exact structure the model hallucinated
-                if isinstance(possible_tool_call, dict) and "name" in possible_tool_call and "arguments" in possible_tool_call:
-                    tool_name = possible_tool_call["name"]
-                    tool_args = possible_tool_call["arguments"]
+                            tool_output = await dispatch_tool(tool_name, parsed_arguments)
+
+                            db_tool = ToolCall(session_id=db_session.id, tool_name=tool_name, tool_input=parsed_arguments, tool_result={"output": tool_output})
+                            db.add(db_tool)
+
+                            db_tool_msg = Message(session_id=db_session.id, role="system", content=f"Tool {tool_name} returned: {tool_output}")
+                            db.add(db_tool_msg)
+                            await db.commit()
+
+                            yield sse_event("tool_result", tool_output)
+
+                            messages.append({"role": "assistant", "content": response_message.content})
+                            messages.append({"role": "user", "content": f"The tool '{tool_name}' returned: {tool_output}. Continue your task."})
+
+                            continue
+
+                    except json.JSONDecodeError:
+                        pass
+
+                    db_msg = Message(session_id=db_session.id, role="assistant", content=response_message.content)
+                    db.add(db_msg)
                     
-                    logger.info(f"Caught rogue JSON tool call: {tool_name}")
-                    result = await dispatch_tool(tool_name, tool_args)
+                    yield sse_event("done", response_message.content)
+                    db_session.status = "complete"
+                    await db.commit()
+                    return   
+                
+                # If it is intermediate thinking before a tool call
+                else:
+                    db_msg = Message(session_id=db_session.id, role="assistant", content=response_message.content)
+                    db.add(db_msg)
+                    await db.commit()
 
-                    db_tool_call = ToolCall(session_id=db_session.id, tool_name=tool_name, tool_input=tool_args, tool_result={"output": result})
+                    yield sse_event("thinking", response_message.content)
+        
+        
+            if response_message.tool_calls:                
+                for tool_call in response_message.tool_calls:
+                    tool_name = tool_call.function.name
+                    
+                    try:
+                        parsed_arguments = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError:
+                        parsed_arguments = {}
+
+                    logger.info(f"Acting: Executing {tool_name}")
+
+                    yield sse_event("tool_call", {"tool_name": tool_name, "arguments": parsed_arguments})
+                    
+                    tool_output = await dispatch_tool(tool_name, parsed_arguments)
+
+                    db_tool_call = ToolCall(
+                        session_id=db_session.id,
+                        tool_name=tool_name,
+                        tool_input=parsed_arguments,
+                        tool_result={"output": tool_output},
+                    )
                     db.add(db_tool_call)
-                    
-                    db_tool_msg = Message(session_id=db_session.id, role="system", content=f"Tool {tool_name} returned: {result}")
+                    await db.commit()
+
+                    db_tool_msg = Message(
+                        session_id=db_session.id,
+                        role="tool",
+                        content=str(tool_output)
+                    )
                     db.add(db_tool_msg)
                     await db.commit()
 
-                    messages.append({"role": "assistant", "content": text_content})
-                    messages.append({"role": "user", "content": f"The tool '{tool_name}' executed successfully and returned this data: {result}. Please provide the final response to the user."})
-                    
-                    # Second LLM Call
-                    final_response = await client.chat.completions.create(
-                        model=settings.LLM_MODEL_NAME,
-                        messages=messages,
-                        stream=True
-                    )
+                    # Append tool result to messages for the LLM to read on the next loop
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "name": tool_name,
+                        "content": str(tool_output)
+                    })
 
-                    final_accumulated_text = ""
-                    async for chunk in final_response:
-                        if chunk.choices[0].delta.content:
-                            content = chunk.choices[0].delta.content
-                            final_accumulated_text += content
-                            yield content
-                            
-                    # Save DB
-                    db_assistant_msg = Message(session_id=db_session.id, role="assistant", content=final_accumulated_text)
-                    db.add(db_assistant_msg)
-                    db_session.status = "complete"
-                    await db.commit()
-                    return
+                # End of iteration. The loop restarts and the LLM observes the results!
+                continue
                 
-            except json.JSONDecodeError:
-                pass
-
-            logger.info("LLM completed request with standard text.")
-
-        yield text_content
-            
-        # Save DB
-        db_assistant_msg = Message(session_id=db_session.id, role="assistant", content=text_content)
-        db.add(db_assistant_msg)
-        db_session.status = "complete"
+        yield sse_event("error", "Agent reached maximum iterations without completing the task.")
+        db_session.status = "error"
         await db.commit()
 
-        return
-
-    return StreamingResponse(agent_stream_generator(), media_type="text/plain")
+    return StreamingResponse(agent_stream_generator(), media_type="text/event-stream")
