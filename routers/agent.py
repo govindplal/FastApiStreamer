@@ -98,6 +98,13 @@ async def run_agent(request: AgentRequest, db:AsyncSession = Depends(get_db)):
                         if idx not in accumulated_tool_calls:
                             accumulated_tool_calls[idx] = {
                                 "id": tc_chunk.id,
+            if delta.tool_calls:
+                for tc_chunk in delta.tool_calls:
+                    if tc_chunk.function:
+                        idx = tc_chunk.index
+                        if idx not in accumulated_tool_calls:
+                            accumulated_tool_calls[idx] = {
+                                "id": tc_chunk.id,
                                 "name": tc_chunk.function.name or "",
                                 "arguments": tc_chunk.function.arguments or ""
                             }
@@ -106,11 +113,6 @@ async def run_agent(request: AgentRequest, db:AsyncSession = Depends(get_db)):
                                 accumulated_tool_calls[idx]["name"] += tc_chunk.function.name
                             if tc_chunk.function.arguments:
                                 accumulated_tool_calls[idx]["arguments"] += tc_chunk.function.arguments
-
-            assistant_message = {"role": "assistant", "content": accumulated_content}
-
-            if accumulated_tool_calls:
-                formatted_tool_calls = []
                 for idx, tc in accumulated_tool_calls.items():
                     formatted_tool_calls.append({
                         "id": tc["id"],
