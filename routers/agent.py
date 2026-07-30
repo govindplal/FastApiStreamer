@@ -1,5 +1,6 @@
 import json
 import re
+import asyncio
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -56,11 +57,38 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": request.prompt}
         ]
+        
+        # State tracker to prevent infinite loops
+        past_actions = {}
 
-        # Format data for Server Sent Events (SSE)
         def sse_event(event_type: str, content: any):
             payload = json.dumps({"type": event_type, "content": content})
             return f"data: {payload}\n\n"
+
+        async def safe_dispatch(name: str, args: dict) -> str:
+            action_signature = f"{name}:{json.dumps(args, sort_keys=True)}"
+            attempts = past_actions.get(action_signature, 0)
+            
+            # Allow a maximum of 2 identical attempts before blacklisting
+            if attempts >= 2:
+                logger.warning(f"Prevented duplicate tool call loop: {name}")
+                return "System Error: You have repeatedly executed this exact tool with these exact arguments and failed. Do not repeat this action. Try a different approach or provide your final answer."
+            
+            past_actions[action_signature] = attempts + 1
+
+            try:
+                # 30-second hard limit per tool
+                result = await asyncio.wait_for(dispatch_tool(name, args), timeout=30.0)
+                return str(result)
+            except asyncio.TimeoutError:
+                error_msg = f"System Error: Tool '{name}' timed out after 30 seconds. You may retry."
+                logger.error(error_msg)
+                return error_msg
+            except Exception as e:
+                error_msg = f"System Error: Tool '{name}' failed with error: {str(e)}. You may retry."
+                logger.error(error_msg)
+                return error_msg
+
 
         max_iterations = 10
         for iteration in range(max_iterations):
@@ -74,7 +102,6 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
                 stream=True
             )
 
-            #Accumulators to trap tool chunks to make streaming and tool executions possible
             accumulated_content = ""
             accumulated_tool_calls = {}
 
@@ -90,7 +117,7 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
                     accumulated_content += content
                     yield sse_event("text_delta", content)
 
-                #Accumulate tool call fragments but do not stream them
+                # Accumulate tool call fragments but do not stream them
                 if delta.tool_calls:
                     for tc_chunk in delta.tool_calls:
                         idx = tc_chunk.index
@@ -123,6 +150,7 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
 
             messages.append(assistant_message)
 
+            # Native Tool Calls
             if accumulated_tool_calls:
                 for idx, tool_data in accumulated_tool_calls.items():
                     tool_name = tool_data["name"]
@@ -134,17 +162,17 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
                     logger.info(f"Acting: Executing {tool_name}")
                     yield sse_event("tool_call", {"name": tool_name, "arguments": parsed_arguments})
 
-                    tool_output = await dispatch_tool(tool_name, parsed_arguments)
+                    tool_output = await safe_dispatch(tool_name, parsed_arguments)
 
                     db_tool = ToolCall(session_id=db_session.id, tool_name=tool_name, tool_input=parsed_arguments, tool_result={"output": tool_output})
                     db.add(db_tool)
-                    db_tool_msg = Message(session_id=db_session.id, role="tool", content=str(tool_output))
+                    db_tool_msg = Message(session_id=db_session.id, role="tool", content=tool_output)
                     db.add(db_tool_msg)
                     await db.commit()
 
                     yield sse_event("tool_result", tool_output)
 
-                    messages.append({"role": "tool", "tool_call_id": tool_data["id"], "name": tool_name, "content": str(tool_output)})
+                    messages.append({"role": "tool", "tool_call_id": tool_data["id"], "name": tool_name, "content": tool_output})
                 continue
 
             # Rogue JSON Trap
@@ -161,19 +189,19 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
                             logger.info(f"Caught rogue JSON tool call: {tool_name}")
                             yield sse_event("tool_call", {"name": tool_name, "arguments": parsed_arguments})
                             
-                            tool_result_str = await dispatch_tool(tool_name, parsed_arguments)
+                            tool_output = await safe_dispatch(tool_name, parsed_arguments)
                             
-                            db_tool = ToolCall(session_id=db_session.id, tool_name=tool_name, tool_input=parsed_arguments, tool_result={"output": tool_result_str})
+                            db_tool = ToolCall(session_id=db_session.id, tool_name=tool_name, tool_input=parsed_arguments, tool_result={"output": tool_output})
                             db.add(db_tool)
-                            db_tool_msg = Message(session_id=db_session.id, role="tool", content=f"Tool {tool_name} returned: {tool_result_str}")
+                            db_tool_msg = Message(session_id=db_session.id, role="tool", content=f"Tool {tool_name} returned: {tool_output}")
                             db.add(db_tool_msg)
                             await db.commit()
                             
-                            yield sse_event("tool_result", tool_result_str)
+                            yield sse_event("tool_result", tool_output)
                             
                             messages.append({
                                 "role": "user", 
-                                "content": f"The tool '{tool_name}' returned: {tool_result_str}. Continue your task."
+                                "content": f"The tool '{tool_name}' returned: {tool_output}. Continue your task."
                             })
                             continue
                 except json.JSONDecodeError:
