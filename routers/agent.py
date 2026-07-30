@@ -58,8 +58,8 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
             {"role": "user", "content": request.prompt}
         ]
         
-        # State tracker to prevent infinite identical loops
-        past_actions = set()
+        # State tracker to prevent infinite loops
+        past_actions = {}
 
         def sse_event(event_type: str, content: any):
             payload = json.dumps({"type": event_type, "content": content})
@@ -67,22 +67,25 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
 
         async def safe_dispatch(name: str, args: dict) -> str:
             action_signature = f"{name}:{json.dumps(args, sort_keys=True)}"
-            if action_signature in past_actions:
-                logger.warning(f"Prevented duplicate tool call: {name}")
-                return "System Error: You have already executed this exact tool with these exact arguments. Do not repeat this action. Try a different approach or provide your final answer."
+            attempts = past_actions.get(action_signature, 0)
             
-            past_actions.add(action_signature)
+            # Allow a maximum of 2 identical attempts before blacklisting
+            if attempts >= 2:
+                logger.warning(f"Prevented duplicate tool call loop: {name}")
+                return "System Error: You have repeatedly executed this exact tool with these exact arguments and failed. Do not repeat this action. Try a different approach or provide your final answer."
+            
+            past_actions[action_signature] = attempts + 1
 
             try:
                 # 30-second hard limit per tool
                 result = await asyncio.wait_for(dispatch_tool(name, args), timeout=30.0)
                 return str(result)
             except asyncio.TimeoutError:
-                error_msg = f"System Error: Tool '{name}' timed out after 30 seconds."
+                error_msg = f"System Error: Tool '{name}' timed out after 30 seconds. You may retry."
                 logger.error(error_msg)
                 return error_msg
             except Exception as e:
-                error_msg = f"System Error: Tool '{name}' failed with error: {str(e)}"
+                error_msg = f"System Error: Tool '{name}' failed with error: {str(e)}. You may retry."
                 logger.error(error_msg)
                 return error_msg
 
