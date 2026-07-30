@@ -86,9 +86,10 @@ async def run_agent(request: AgentRequest, db:AsyncSession = Depends(get_db)):
                 delta = chunk.choices[0].delta
 
                 #Accumulate text and stream it instantly
-                if delta.content:
-                    accumulated_content += delta.content
-                    yield sse_event("text_delta", delta.content)
+                content = delta.content or delta.refusal
+                if content:
+                    accumulated_content += content
+                    yield sse_event("text_delta", content)
 
                 #Accumulate tool call fragments but do not stream them
                 if delta.tool_calls:
