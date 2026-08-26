@@ -1,4 +1,5 @@
-from sqlalchemy import Column, String, JSON, Integer, ForeignKey, DateTime, func
+from sqlalchemy import Column, String, JSON, Integer, ForeignKey, DateTime, Text, func
+from pgvector.sqlalchemy import Vector
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from datetime import datetime
 
@@ -31,3 +32,12 @@ class ToolCall(Base):
     tool_input: Mapped[dict] = mapped_column(JSON)
     tool_result: Mapped[dict] = mapped_column(JSON, nullable=True)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=True)
+
+class MemoryEntry(Base):
+    __tablename__ = "memory_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    content = Column(Text, nullable=False)
+    
+    # Nomic-embed-text outputs 768 dimensions
+    embedding = Column(Vector(768))

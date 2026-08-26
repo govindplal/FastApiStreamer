@@ -3,6 +3,8 @@ import html2text
 import httpx
 from loguru import logger
 from playwright.async_api import async_playwright
+from core.database import AsyncSessionLocal
+from core.memory import semantic_search
 
 
 async def get_webpage_content(url: str) -> str:
@@ -47,3 +49,13 @@ async def extract_markdown_from_url(url: str) -> str:
     except Exception as e:
         logger.error(f"Playwright extraction failed: {str(e)}")
         return f"Error extracting content: {str(e)}"
+
+async def search_memory(query: str) -> str:
+    """Queries long-term semantic memory for relevant past observations"""
+    async with AsyncSessionLocal() as session:
+        results = await semantic_search(query = query, db=session, top_k=3)
+        if not results:
+            return "No relevant memories found."
+
+        formatted = [f"- {entry.content}" for entry in results]
+        return "Relevant memories found:\n" + "\n".join(formatted)

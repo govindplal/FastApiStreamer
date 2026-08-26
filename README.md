@@ -1,11 +1,12 @@
 # Aperture
 
-Aperture is the foundational backend for an agentic AI system. Currently at **Checkpoint 07 of 15** in its build phase, this repository houses a high-performance, asynchronous FastAPI web server designed to handle real-time streaming LLM responses and robust tool-calling capabilities.
+Aperture is the foundational backend for an agentic AI system. Currently at **Checkpoint 08 of 15** in its build phase, this repository houses a high-performance, asynchronous FastAPI web server designed to handle real-time streaming LLM responses and robust tool-calling capabilities.
 
 This backend is built to bypass heavy abstractions (like LangChain) in favor of native SDKs, strong data contracts, and raw speed.
 
 ## 🚀 Features
 
+* **Semantic Long-Term Memory:** Integrated `pgvector` into PostgreSQL to store agent observations as 768-dimensional vectors (using local Nomic embeddings). The agent automatically saves tool results and can autonomously query its past experiences across sessions using cosine similarity search, giving it true object permanence.
 * **Full ReAct (Reason + Act) Loop:** The core agent runs on an autonomous `Think -> Act -> Observe` cycle. It can execute multi-turn workflows (e.g., scrape a page, read the result, realize it needs to use a math tool, and loop again) until the task is complete, protected by a max-iteration safety cap.
 * **Resilient Tool Execution Engine:** Tool dispatching is wrapped in a `safe_dispatch` layer that provides 30-second timeout guards, catches unhandled exceptions, and enforces a bounded retry policy (max 2 identical attempts) to prevent infinite loops while allowing recovery from transient network errors.
 * **Interleaved SSE Streaming:** Utilizes Server-Sent Events (`text/event-stream`) with a custom chunk accumulator. The API streams real-time `text_delta` chunks to the user instantly, while silently trapping and reassembling JSON tool fragments in the background, allowing for seamless UI rendering during complex executions.
@@ -14,7 +15,7 @@ This backend is built to bypass heavy abstractions (like LangChain) in favor of 
 * **Automated Schema Migrations:** Fully integrated `Alembic` environment configured for asynchronous execution to manage database evolution without breaking the containerized stack.
 * **Multi-Tool Dispatch Registry:** Features a custom, asynchronous tool registry that parses LLM intentions, dynamically matches requests to active functions, validates JSON arguments, and runs tool code seamlessly.
 * **Headless DOM-to-Markdown Extraction:** Integrates automated browser instances to load JavaScript-rendered components, bypass basic bot blocks via custom headers, and process heavy raw DOM footprints into clean, context-efficient Markdown text.
-* **Containerized Infrastructure:** A unified `docker-compose` stack running a hot-reloading Linux API container, PostgreSQL 16, and Redis 7 on an isolated internal network.
+* **Containerized Infrastructure:** A unified `docker-compose` stack running a hot-reloading Linux API container, PostgreSQL 16 (with pgvector), and Redis 7 on an isolated internal network.
 * **OpenAI-Compatible Architecture:** Built with the `openai` Python SDK, seamlessly supporting local models (like Qwen via Ollama) and production APIs with zero code changes.
 
 ## 📁 Repository Structure
@@ -26,7 +27,8 @@ aperture/
 ├── core/
 │   ├── config.py        # Pydantic environment validation
 │   ├── database.py      # Async Postgres engine and dependency injection
-│   └── llm.py           # OpenAI client Singleton initialization
+│   ├── llm.py           # OpenAI client Singleton initialization
+│   └── memory.py        # pgvector embedding and cosine similarity search
 ├── migrations/          # Alembic asynchronous migration scripts and environment
 ├── models/
 │   ├── chat.py          # Pydantic Request/Response schemas
@@ -35,7 +37,7 @@ aperture/
 │   └── agent.py         # ReAct loop, chunk accumulator, safe dispatch, and SSE stream
 ├── tools/
 │   ├── __init__.py      
-│   ├── functions.py     # Executable Python functions (Playwright extraction, string math)
+│   ├── functions.py     # Executable Python functions (Playwright extraction, memory search)
 │   ├── registry.py      # Async tool dispatcher map
 │   └── schemas.py       # JSON schemas representing the tool menu to the LLM
 ├── .env                 # Secrets and routing config (git-ignored)
@@ -74,6 +76,7 @@ LLM_MODEL_NAME=qwen2.5-coder:7b
 POSTGRES_USER=postgres
 POSTGRES_PASSWORD=postgres
 POSTGRES_DB=aperture
+POSTGRES_HOST=postgres
 ```
 
 ### 3. Boot the Infrastructure (Recommended)
@@ -86,7 +89,7 @@ docker compose up --build
 ### Alternative: Local Host Execution
 If you prefer running without Docker, use `uv` for dependency management:
 ```bash
-uv add playwright html2text sqlalchemy alembic asyncpg
+uv add playwright html2text sqlalchemy alembic asyncpg pgvector sentence-transformers
 uv run playwright install chromium
 uv run uvicorn main:app --reload
 ```
@@ -116,6 +119,14 @@ curl -N -X POST "http://localhost:8000/agent/run" \
      -d "{\"prompt\": \"Go to news.ycombinator.com, find the title of the top post, and calculate its string length.\"}"
 ```
 
+**Test 4: Object Permanence (Semantic Memory)**
+```bash
+# Run this after Test 2 or 3 to see the agent pull from its pgvector memory
+curl -N -X POST "http://localhost:8000/agent/run" \
+     -H "Content-Type: application/json" \
+     -d "{\"prompt\": \"Search your memory. Did you recently calculate the length of a string? What was the result?\"}"
+```
+
 ## 🗺️ Roadmap
 - [x] **01** FastAPI Application Foundation
 - [x] **02** Manual Tool Dispatch System
@@ -124,7 +135,7 @@ curl -N -X POST "http://localhost:8000/agent/run" \
 - [x] **05** Docker Compose Stack (Postgres + Redis)
 - [x] **06** Postgres Models + Alembic Migrations
 - [x] **07** Full ReAct Agent Loop
-- [ ] **08** pgvector Semantic Memory
+- [x] **08** pgvector Semantic Memory
 - [ ] **09** Workflow Graph + Deterministic Replay
 - [ ] **10** Redis Task Queue + SSE
 - [ ] **11** Next.js Agent UI
