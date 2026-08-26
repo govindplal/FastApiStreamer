@@ -29,4 +29,19 @@ calculate_string_length = {
         }
 }
 
-AGENT_TOOLS = [extract_markdown_from_url, calculate_string_length]
+search_memory_tool = {
+    "type": "function",
+    "function":{
+        "name": "search_memory",
+        "description": "Searches the agent's long-term memory for past observations, facts, or notes using semantic similarity.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "The search query to match against past observations."},
+            },
+            "required": ["query"]
+        }
+    }
+}
+
+AGENT_TOOLS = [extract_markdown_from_url, calculate_string_length, search_memory_tool]

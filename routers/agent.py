@@ -12,6 +12,7 @@ from tools.schemas import AGENT_TOOLS
 
 from core.config import settings
 from core.llm import client
+from core.memory import store_memory
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.database import get_db
@@ -164,6 +165,9 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
 
                     tool_output = await safe_dispatch(tool_name, parsed_arguments)
 
+                    if tool_output and not tool_output.startswith("System Error:"):
+                        await store_memory(content=f"Tool '{tool_name}' observed: {tool_output[:1000]}", db=db)
+                    
                     db_tool = ToolCall(session_id=db_session.id, tool_name=tool_name, tool_input=parsed_arguments, tool_result={"output": tool_output})
                     db.add(db_tool)
                     db_tool_msg = Message(session_id=db_session.id, role="tool", content=tool_output)
@@ -190,6 +194,9 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
                             yield sse_event("tool_call", {"name": tool_name, "arguments": parsed_arguments})
                             
                             tool_output = await safe_dispatch(tool_name, parsed_arguments)
+
+                            if tool_output and not tool_output.startswith("System Error:"):
+                                await store_memory(content=f"Tool '{tool_name}' observed: {tool_output[:1000]}", db=db)
                             
                             db_tool = ToolCall(session_id=db_session.id, tool_name=tool_name, tool_input=parsed_arguments, tool_result={"output": tool_output})
                             db.add(db_tool)
