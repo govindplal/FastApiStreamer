@@ -2,11 +2,12 @@ import json
 import re
 import asyncio
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel
 
+from core.graph import GraphTracker
 from tools.registry import dispatch_tool
 from tools.schemas import AGENT_TOOLS
 
@@ -15,6 +16,7 @@ from core.llm import client
 from core.memory import store_memory
 
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from core.database import get_db
 from models.db import Session, Message, ToolCall
 
@@ -52,6 +54,8 @@ async def run_agent(request: Request, agent_request: AgentRequest, db: AsyncSess
 
     logger.info(f"Starting ReAct loop for task: {agent_request.prompt}")
 
+    graph = GraphTracker()
+    graph.add_node("user_prompt",agent_request.prompt)
     async def agent_stream_generator():
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -135,6 +139,10 @@ async def run_agent(request: Request, agent_request: AgentRequest, db: AsyncSess
                                 accumulated_tool_calls[idx]["arguments"] += tc_chunk.function.arguments
 
             assistant_message = {"role": "assistant", "content": accumulated_content}
+
+            if accumulated_content:
+                graph.add_node("think", accumulated_content)
+        
             if accumulated_tool_calls:
                 formatted_tool_calls = []
                 for idx, tc in accumulated_tool_calls.items():
@@ -169,6 +177,8 @@ async def run_agent(request: Request, agent_request: AgentRequest, db: AsyncSess
 
                     logger.info(f"Acting: Queuing {tool_name}")
                     yield sse_event("tool_call", {"name": tool_name, "arguments": parsed_arguments})
+
+                    graph.add_node("tool_call", {"name": tool_name, "arguments": parsed_arguments})
                     
                     dispatch_tasks.append(safe_dispatch(tool_name, parsed_arguments))
                     tool_metadata.append((tool_data["id"], tool_name, parsed_arguments))
@@ -177,6 +187,9 @@ async def run_agent(request: Request, agent_request: AgentRequest, db: AsyncSess
                 tool_outputs = await asyncio.gather(*dispatch_tasks)
 
                 for (tool_call_id, tool_name, parsed_arguments), tool_output in zip(tool_metadata, tool_outputs):
+
+                    graph.add_node("tool_result", {"name": tool_name, "output": tool_output})
+
                     if tool_output and not tool_output.startswith("System Error:"):
                         await store_memory(content=f"Tool '{tool_name}' observed: {tool_output[:1000]}", db=db)
                     
@@ -204,8 +217,10 @@ async def run_agent(request: Request, agent_request: AgentRequest, db: AsyncSess
                             logger.info(f"Caught rogue JSON tool call: {tool_name}")
                             yield sse_event("tool_call", {"name": tool_name, "arguments": parsed_arguments})
                             
+                            graph.add_node("tool_call", {"name": tool_name, "arguments": parsed_arguments})
+
                             tool_output = await safe_dispatch(tool_name, parsed_arguments)
-                            
+
                             if tool_output and not tool_output.startswith("System Error:"):
                                 await store_memory(content=f"Tool '{tool_name}' observed: {tool_output[:1000]}", db=db)
                             
@@ -216,6 +231,8 @@ async def run_agent(request: Request, agent_request: AgentRequest, db: AsyncSess
                             await db.commit()
                             
                             yield sse_event("tool_result", tool_output)
+
+                            graph.add_node("tool_result", {"name": tool_name, "output": tool_output})
                             
                             messages.append({
                                 "role": "user", 
@@ -227,6 +244,9 @@ async def run_agent(request: Request, agent_request: AgentRequest, db: AsyncSess
                 
                 db_msg = Message(session_id=db_session.id, role="assistant", content=accumulated_content)
                 db.add(db_msg)
+
+                graph.add_node("done", accumulated_content)
+                db_session.workflow_graph = graph.nodes
                 
                 yield sse_event("done", "")
                 db_session.status = "complete"
@@ -246,3 +266,31 @@ async def run_agent(request: Request, agent_request: AgentRequest, db: AsyncSess
             await db.commit()
 
     return StreamingResponse(agent_stream_generator(), media_type="text/event-stream")
+
+@router.get("/{session_id}/replay")
+async def replay_session(session_id: int, db: AsyncSession = Depends(get_db)):
+    query = select(Session).where(Session.id == session_id)
+    result = await db.execute(query)
+    db_session = result.scalar_one_or_none()
+
+    if not db_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    async def replay_generator():
+        if not db_session.workflow_graph:
+            error_payload = json.dumps({"type": "error", "content": "No workflow graph found for this session."})
+            yield f"data: {error_payload}\n\n"
+            return
+
+        for node in db_session.workflow_graph:
+
+            payload = json.dumps({
+                "type": node["type"],
+                "content": node["content"],
+            })
+
+            yield f"data: {payload}\n\n"
+
+            await asyncio.sleep(0.5)
+        
+    return StreamingResponse(replay_generator(), media_type="text/event-stream")

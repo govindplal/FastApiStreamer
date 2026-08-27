@@ -1,5 +1,6 @@
 from sqlalchemy import Column, String, JSON, Integer, ForeignKey, DateTime, Text, func
 from pgvector.sqlalchemy import Vector
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from datetime import datetime
 
@@ -13,6 +14,7 @@ class Session(Base):
     task: Mapped[str] = mapped_column(String)
     status: Mapped[str] = mapped_column(String, default="running")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    workflow_graph = Column(JSONB, default=list)
 
 class Message(Base):
     __tablename__ = "messages"
