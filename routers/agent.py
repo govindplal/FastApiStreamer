@@ -2,7 +2,7 @@ import json
 import re
 import asyncio
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel
@@ -35,32 +35,31 @@ class AgentRequest(BaseModel):
     prompt: str
 
 @router.post("/run")
-async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
+async def run_agent(request: Request, agent_request: AgentRequest, db: AsyncSession = Depends(get_db)):
 
-    db_session = Session(task=request.prompt)
+    db_session = Session(task=agent_request.prompt)
     db.add(db_session)
     await db.commit()
     await db.refresh(db_session)
 
-    # Log the initial user message
     db_msg = Message(
         session_id=db_session.id,
         role="user",
-        content=request.prompt
+        content=agent_request.prompt
     )
     db.add(db_msg)
     await db.commit()
 
-    logger.info(f"Starting ReAct loop for task: {request.prompt}")
+    logger.info(f"Starting ReAct loop for task: {agent_request.prompt}")
 
     async def agent_stream_generator():
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": request.prompt}
+            {"role": "user", "content": agent_request.prompt}
         ]
         
-        # State tracker to prevent infinite loops
         past_actions = {}
+        exit_reason = "max_iterations"  
 
         def sse_event(event_type: str, content: any):
             payload = json.dumps({"type": event_type, "content": content})
@@ -70,7 +69,6 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
             action_signature = f"{name}:{json.dumps(args, sort_keys=True)}"
             attempts = past_actions.get(action_signature, 0)
             
-            # Allow a maximum of 2 identical attempts before blacklisting
             if attempts >= 2:
                 logger.warning(f"Prevented duplicate tool call loop: {name}")
                 return "System Error: You have repeatedly executed this exact tool with these exact arguments and failed. Do not repeat this action. Try a different approach or provide your final answer."
@@ -78,7 +76,6 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
             past_actions[action_signature] = attempts + 1
 
             try:
-                # 30-second hard limit per tool
                 result = await asyncio.wait_for(dispatch_tool(name, args), timeout=30.0)
                 return str(result)
             except asyncio.TimeoutError:
@@ -90,9 +87,14 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
                 logger.error(error_msg)
                 return error_msg
 
-
         max_iterations = 10
         for iteration in range(max_iterations):
+            # Check client connectivity before requesting the LLM turn
+            if await request.is_disconnected():
+                logger.warning("Client disconnected. Halting ReAct loop.")
+                exit_reason = "disconnected"
+                break
+
             logger.info(f"--- Loop Iteration {iteration + 1} ---")
 
             response = await client.chat.completions.create(
@@ -112,13 +114,11 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
 
                 delta = chunk.choices[0].delta
 
-                # Accumulate text and stream it instantly
                 content = delta.content or delta.refusal
                 if content:
                     accumulated_content += content
                     yield sse_event("text_delta", content)
 
-                # Accumulate tool call fragments but do not stream them
                 if delta.tool_calls:
                     for tc_chunk in delta.tool_calls:
                         idx = tc_chunk.index
@@ -134,7 +134,6 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
                             if tc_chunk.function and tc_chunk.function.arguments:
                                 accumulated_tool_calls[idx]["arguments"] += tc_chunk.function.arguments
 
-            # Format tool calls for the message history
             assistant_message = {"role": "assistant", "content": accumulated_content}
             if accumulated_tool_calls:
                 formatted_tool_calls = []
@@ -151,8 +150,16 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
 
             messages.append(assistant_message)
 
-            # Native Tool Calls
+            if not accumulated_content and not accumulated_tool_calls:
+                logger.error("LLM returned an empty response.")
+                exit_reason = "empty_response"
+                break
+
+            # Path A: Concurrent Native Tool Execution
             if accumulated_tool_calls:
+                dispatch_tasks = []
+                tool_metadata = []
+
                 for idx, tool_data in accumulated_tool_calls.items():
                     tool_name = tool_data["name"]
                     try:
@@ -160,11 +167,16 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
                     except json.JSONDecodeError:
                         parsed_arguments = {}
 
-                    logger.info(f"Acting: Executing {tool_name}")
+                    logger.info(f"Acting: Queuing {tool_name}")
                     yield sse_event("tool_call", {"name": tool_name, "arguments": parsed_arguments})
+                    
+                    dispatch_tasks.append(safe_dispatch(tool_name, parsed_arguments))
+                    tool_metadata.append((tool_data["id"], tool_name, parsed_arguments))
 
-                    tool_output = await safe_dispatch(tool_name, parsed_arguments)
+                # Concurrently execute tools 
+                tool_outputs = await asyncio.gather(*dispatch_tasks)
 
+                for (tool_call_id, tool_name, parsed_arguments), tool_output in zip(tool_metadata, tool_outputs):
                     if tool_output and not tool_output.startswith("System Error:"):
                         await store_memory(content=f"Tool '{tool_name}' observed: {tool_output[:1000]}", db=db)
                     
@@ -175,11 +187,10 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
                     await db.commit()
 
                     yield sse_event("tool_result", tool_output)
-
-                    messages.append({"role": "tool", "tool_call_id": tool_data["id"], "name": tool_name, "content": tool_output})
+                    messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": tool_output})
                 continue
 
-            # Rogue JSON Trap
+            # Path B: Rogue JSON Trap
             elif accumulated_content:
                 try:
                     json_match = re.search(r'\{.*\}', accumulated_content, re.DOTALL)
@@ -194,7 +205,7 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
                             yield sse_event("tool_call", {"name": tool_name, "arguments": parsed_arguments})
                             
                             tool_output = await safe_dispatch(tool_name, parsed_arguments)
-
+                            
                             if tool_output and not tool_output.startswith("System Error:"):
                                 await store_memory(content=f"Tool '{tool_name}' observed: {tool_output[:1000]}", db=db)
                             
@@ -208,7 +219,7 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
                             
                             messages.append({
                                 "role": "user", 
-                                "content": f"The tool '{tool_name}' returned: {tool_output}. Continue your task."
+                                "content": f"[Tool Observation for '{tool_name}']: {tool_output}. Continue your task."
                             })
                             continue
                 except json.JSONDecodeError:
@@ -222,8 +233,16 @@ async def run_agent(request: AgentRequest, db: AsyncSession = Depends(get_db)):
                 await db.commit()
                 return
 
-        yield sse_event("error", "Agent reached maximum iterations.")
-        db_session.status = "error"
-        await db.commit()
+        if exit_reason == "disconnected":
+            db_session.status = "cancelled"
+            await db.commit()
+        elif exit_reason == "empty_response":
+            yield sse_event("error", "Agent received empty response from LLM provider.")
+            db_session.status = "error"
+            await db.commit()
+        elif exit_reason == "max_iterations":
+            yield sse_event("error", "Agent reached maximum iterations.")
+            db_session.status = "error"
+            await db.commit()
 
     return StreamingResponse(agent_stream_generator(), media_type="text/event-stream")
