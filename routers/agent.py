@@ -333,6 +333,7 @@ async def override_replay_session(
 
         #Rebuild history up to the target node
         target_found = False
+
         active_tool_ids = {}
         for node in old_session.workflow_graph:
             node_type = node["type"]
@@ -349,12 +350,13 @@ async def override_replay_session(
             elif node_type == "tool_call":
                 tool_name = content.get("name", "unknown")
                 args = content.get("arguments", {})
+                active_tool_ids[tool_name] = node["id"]
                 messages.append({"role": "assistant", "tool_calls": [{"id": node["id"], "type": "function", "function": {"name": tool_name, "arguments": json.dumps(args)}}]})
                 graph.add_node("tool_call", content)
             
             elif node_type == "tool_result":
                 tool_name = content.get("name", "unknown")
-                call_id = node.get("parent_id")
+                call_id = active_tool_ids.get(tool_name, node["parent_id"])
                 
                 #If we hit the node we want to change, inject the override and break
                 if node["id"] == override_req.node_id:
