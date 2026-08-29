@@ -249,21 +249,23 @@ async def run_agent(request: Request, agent_request: AgentRequest, db: AsyncSess
                 
                 yield sse_event("done", "")
                 db_session.status = "complete"
+                db_session.workflow_graph = graph.nodes
                 await db.commit()
                 return
 
-        db_session.workflow_graph = graph.nodes
-
         if exit_reason == "disconnected":
             db_session.status = "cancelled"
+            db_session.workflow_graph = graph.nodes
             await db.commit()
         elif exit_reason == "empty_response":
             yield sse_event("error", "Agent received empty response from LLM provider.")
             db_session.status = "error"
+            db_session.workflow_graph = graph.nodes
             await db.commit()
         elif exit_reason == "max_iterations":
             yield sse_event("error", "Agent reached maximum iterations.")
             db_session.status = "error"
+            db_session.workflow_graph = graph.nodes
             await db.commit()
 
     return StreamingResponse(agent_stream_generator(), media_type="text/event-stream")
@@ -286,6 +288,7 @@ async def replay_session(session_id: int, db: AsyncSession = Depends(get_db)):
         for node in db_session.workflow_graph:
 
             payload = json.dumps({
+                "id": node["id"],
                 "type": node["type"],
                 "content": node["content"],
             })
@@ -328,6 +331,7 @@ async def override_replay_session(
 
         #Rebuild history up to the target node
         target_found = False
+        active_tool_ids = {}
         for node in old_session.workflow_graph:
             node_type = node["type"]
             content = node["content"]
@@ -339,35 +343,37 @@ async def override_replay_session(
             elif node_type == "think":
                 messages.append({"role": "assistant", "content": content})
                 graph.add_node("think", content)
-            
+
             elif node_type == "tool_call":
                 tool_name = content.get("name", "unknown")
                 args = content.get("arguments", {})
+                active_tool_ids[tool_name] = node["id"]
                 messages.append({"role": "assistant", "tool_calls": [{"id": node["id"], "type": "function", "function": {"name": tool_name, "arguments": json.dumps(args)}}]})
                 graph.add_node("tool_call", content)
             
             elif node_type == "tool_result":
                 tool_name = content.get("name", "unknown")
+                call_id = active_tool_ids.get(tool_name, node["parent_id"])
                 
                 #If we hit the node we want to change, inject the override and break
                 if node["id"] == override_req.node_id:
                     messages.append({
-                        "role": "user", 
-                        "content": f"[Tool Observation for '{tool_name}']: {override_req.override_result}. Continue your task."
+                        "role": "tool", 
+                        "tool_call_id": call_id, "name": tool_name, "content": override_req.override_result
                     })
                     graph.add_node("tool_result", {"name": tool_name, "output": override_req.override_result})
                     target_found = True
                     break 
                 else:
-                    output = content.get("output", "")
                     messages.append({
-                        "role": "user", 
-                        "content": f"[Tool Observation for '{tool_name}']: {output}. Continue your task."
+                        "role": "tool", 
+                        "tool_call_id": call_id, "name": tool_name, "content": content.get("output", "")
                     })
                     graph.add_node("tool_result", content)
         
         if not target_found:
             new_db_session.status = "error"
+            new_db_session.workflow_graph = graph.nodes
             await db.commit()
             yield sse_event("error", "Target node ID not found in graph.")
             return
@@ -444,7 +450,7 @@ async def override_replay_session(
                     tool_name = tool_data["name"]
                     try:
                         parsed_arguments = json.loads(tool_data["arguments"])
-                    except:
+                    except json.JSONDecodeError:
                         parsed_arguments = {}
                     yield sse_event("tool_call", {"name": tool_name, "arguments": parsed_arguments})
                     graph.add_node("tool_call", {"name": tool_name, "arguments": parsed_arguments})
@@ -497,11 +503,13 @@ async def override_replay_session(
                 
                 yield sse_event("done", "")
                 new_db_session.status = "complete"
+                new_db_session.workflow_graph = graph.nodes
                 await db.commit()
                 return
 
         if exit_reason in ["disconnected", "empty_response", "max_iterations"]:
             new_db_session.status = "error" if exit_reason != "disconnected" else "cancelled"
+            new_db_session.workflow_graph = graph.nodes
             await db.commit()
 
     return StreamingResponse(replay_override_generator(), media_type="text/event-stream")
