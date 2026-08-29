@@ -140,7 +140,7 @@ async def run_agent(request: Request, agent_request: AgentRequest, db: AsyncSess
 
             assistant_message = {"role": "assistant", "content": accumulated_content}
 
-            if accumulated_content:
+            if accumulated_content and accumulated_tool_calls:
                 graph.add_node("think", accumulated_content)
         
             if accumulated_tool_calls:
@@ -246,12 +246,13 @@ async def run_agent(request: Request, agent_request: AgentRequest, db: AsyncSess
                 db.add(db_msg)
 
                 graph.add_node("done", accumulated_content)
-                db_session.workflow_graph = graph.nodes
                 
                 yield sse_event("done", "")
                 db_session.status = "complete"
                 await db.commit()
                 return
+
+        db_session.workflow_graph = graph.nodes
 
         if exit_reason == "disconnected":
             db_session.status = "cancelled"
@@ -342,7 +343,7 @@ async def override_replay_session(
             elif node_type == "tool_call":
                 tool_name = content.get("name", "unknown")
                 args = content.get("arguments", {})
-                messages.append({"role": "assistant", "content": f"I decided to use {tool_name} with arguments {json.dumps(args)}."})
+                messages.append({"role": "assistant", "tool_calls": [{"id": node["id"], "type": "function", "function": {"name": tool_name, "arguments": json.dumps(args)}}]})
                 graph.add_node("tool_call", content)
             
             elif node_type == "tool_result":
@@ -366,6 +367,8 @@ async def override_replay_session(
                     graph.add_node("tool_result", content)
         
         if not target_found:
+            new_db_session.status = "error"
+            await db.commit()
             yield sse_event("error", "Target node ID not found in graph.")
             return
 
