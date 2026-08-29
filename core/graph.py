@@ -1,6 +1,8 @@
 import time
 import uuid
 
+from pydantic import BaseModel
+
 
 class GraphTracker:
     def __init__(self):
@@ -19,3 +21,7 @@ class GraphTracker:
         self.nodes.append(node)
         self.current_parent = node_id
         return node_id
+
+class ReplayOverrideRequest(BaseModel):
+    node_id: str
+    override_result: str

@@ -7,7 +7,7 @@ from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel
 
-from core.graph import GraphTracker
+from core.graph import GraphTracker, ReplayOverrideRequest
 from tools.registry import dispatch_tool
 from tools.schemas import AGENT_TOOLS
 
@@ -294,3 +294,211 @@ async def replay_session(session_id: int, db: AsyncSession = Depends(get_db)):
             await asyncio.sleep(0.5)
         
     return StreamingResponse(replay_generator(), media_type="text/event-stream")
+
+@router.post("/{session_id}/replay")
+async def override_replay_session(
+    session_id: int, 
+    override_req: ReplayOverrideRequest, 
+    request: Request, 
+    db: AsyncSession = Depends(get_db)
+):
+    query = select(Session).where(Session.id == session_id)
+    result = await db.execute(query)
+    old_session = result.scalar_one_or_none()
+
+    if not old_session or not old_session.workflow_graph:
+        raise HTTPException(status_code=404, detail="Session or graph not found")
+
+    #Create a new DB Session for this alternate timeline
+    new_db_session = Session(task=f"Replay of Session {session_id} (Node Override)")
+    db.add(new_db_session)
+    await db.commit()
+    await db.refresh(new_db_session)
+
+    logger.info(f"Starting Override Replay for Session {session_id}")
+
+    async def replay_override_generator():
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        graph = GraphTracker()
+        
+        def sse_event(event_type: str, content: any):
+            payload = json.dumps({"type": event_type, "content": content})
+            return f"data: {payload}\n\n"
+
+        #Rebuild history up to the target node
+        target_found = False
+        for node in old_session.workflow_graph:
+            node_type = node["type"]
+            content = node["content"]
+            
+            if node_type == "user_prompt":
+                messages.append({"role": "user", "content": content})
+                graph.add_node("user_prompt", content)
+            
+            elif node_type == "think":
+                messages.append({"role": "assistant", "content": content})
+                graph.add_node("think", content)
+            
+            elif node_type == "tool_call":
+                tool_name = content.get("name", "unknown")
+                args = content.get("arguments", {})
+                messages.append({"role": "assistant", "content": f"I decided to use {tool_name} with arguments {json.dumps(args)}."})
+                graph.add_node("tool_call", content)
+            
+            elif node_type == "tool_result":
+                tool_name = content.get("name", "unknown")
+                
+                #If we hit the node we want to change, inject the override and break
+                if node["id"] == override_req.node_id:
+                    messages.append({
+                        "role": "user", 
+                        "content": f"[Tool Observation for '{tool_name}']: {override_req.override_result}. Continue your task."
+                    })
+                    graph.add_node("tool_result", {"name": tool_name, "output": override_req.override_result})
+                    target_found = True
+                    break 
+                else:
+                    output = content.get("output", "")
+                    messages.append({
+                        "role": "user", 
+                        "content": f"[Tool Observation for '{tool_name}']: {output}. Continue your task."
+                    })
+                    graph.add_node("tool_result", content)
+        
+        if not target_found:
+            yield sse_event("error", "Target node ID not found in graph.")
+            return
+
+        # 4. RESTART THE ENGINE
+        past_actions = {}
+        exit_reason = "max_iterations"
+        
+        async def safe_dispatch(name: str, args: dict) -> str:
+            action_signature = f"{name}:{json.dumps(args, sort_keys=True)}"
+            attempts = past_actions.get(action_signature, 0)
+            if attempts >= 2:
+                return "System Error: Duplicate tool call prevented."
+            past_actions[action_signature] = attempts + 1
+            try:
+                result = await asyncio.wait_for(dispatch_tool(name, args), timeout=30.0)
+                return str(result)
+            except Exception as e:
+                return f"System Error: {str(e)}"
+
+        # The standard ReAct loop running in the new timeline
+        max_iterations = 10
+        for iteration in range(max_iterations):
+            if await request.is_disconnected():
+                exit_reason = "disconnected"
+                break
+
+            response = await client.chat.completions.create(
+                model=settings.LLM_MODEL_NAME,
+                messages=messages,
+                tools=AGENT_TOOLS,
+                tool_choice="auto",
+                stream=True
+            )
+
+            accumulated_content = ""
+            accumulated_tool_calls = {}
+
+            async for chunk in response:
+                if not chunk.choices: continue
+                delta = chunk.choices[0].delta
+                content = delta.content or delta.refusal
+                if content:
+                    accumulated_content += content
+                    yield sse_event("text_delta", content)
+
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in accumulated_tool_calls:
+                            accumulated_tool_calls[idx] = {"id": tc.id, "name": tc.function.name or "", "arguments": tc.function.arguments or ""}
+                        else:
+                            if tc.function and tc.function.name: accumulated_tool_calls[idx]["name"] += tc.function.name
+                            if tc.function and tc.function.arguments: accumulated_tool_calls[idx]["arguments"] += tc.function.arguments
+
+            assistant_msg = {"role": "assistant", "content": accumulated_content}
+            if accumulated_content: graph.add_node("think", accumulated_content)
+
+            if accumulated_tool_calls:
+                formatted_tcs = []
+                for idx, tc in accumulated_tool_calls.items():
+                    formatted_tcs.append({"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": tc["arguments"]}})
+                assistant_msg["tool_calls"] = formatted_tcs
+            messages.append(assistant_msg)
+
+            if not accumulated_content and not accumulated_tool_calls:
+                exit_reason = "empty_response"
+                break
+
+            if accumulated_tool_calls:
+                dispatch_tasks = []
+                tool_metadata = []
+                for idx, tool_data in accumulated_tool_calls.items():
+                    tool_name = tool_data["name"]
+                    try:
+                        parsed_arguments = json.loads(tool_data["arguments"])
+                    except:
+                        parsed_arguments = {}
+                    yield sse_event("tool_call", {"name": tool_name, "arguments": parsed_arguments})
+                    graph.add_node("tool_call", {"name": tool_name, "arguments": parsed_arguments})
+                    dispatch_tasks.append(safe_dispatch(tool_name, parsed_arguments))
+                    tool_metadata.append((tool_data["id"], tool_name, parsed_arguments))
+
+                tool_outputs = await asyncio.gather(*dispatch_tasks)
+                for (tc_id, t_name, p_args), t_output in zip(tool_metadata, tool_outputs):
+                    graph.add_node("tool_result", {"name": t_name, "output": t_output})
+                    if t_output and not t_output.startswith("System Error:"):
+                        await store_memory(content=f"Tool '{t_name}' observed: {t_output[:1000]}", db=db)
+                    
+                    db_tool = ToolCall(session_id=new_db_session.id, tool_name=t_name, tool_input=p_args, tool_result={"output": t_output})
+                    db.add(db_tool)
+                    db.add(Message(session_id=new_db_session.id, role="tool", content=t_output))
+                    await db.commit()
+                    yield sse_event("tool_result", t_output)
+                    messages.append({"role": "tool", "tool_call_id": tc_id, "name": t_name, "content": t_output})
+                continue
+
+            elif accumulated_content:
+                try:
+                    json_match = re.search(r'\{.*\}', accumulated_content, re.DOTALL)
+                    if json_match:
+                        possible_tc = json.loads(json_match.group(0))
+                        if isinstance(possible_tc, dict) and "name" in possible_tc and "arguments" in possible_tc:
+                            t_name = possible_tc["name"]
+                            p_args = possible_tc["arguments"]
+                            yield sse_event("tool_call", {"name": t_name, "arguments": p_args})
+                            graph.add_node("tool_call", {"name": t_name, "arguments": p_args})
+                            
+                            t_output = await safe_dispatch(t_name, p_args)
+                            if t_output and not t_output.startswith("System Error:"):
+                                await store_memory(content=f"Tool '{t_name}' observed: {t_output[:1000]}", db=db)
+                            
+                            db_tool = ToolCall(session_id=new_db_session.id, tool_name=t_name, tool_input=p_args, tool_result={"output": t_output})
+                            db.add(db_tool)
+                            db.add(Message(session_id=new_db_session.id, role="tool", content=f"Tool {t_name} returned: {t_output}"))
+                            await db.commit()
+                            
+                            yield sse_event("tool_result", t_output)
+                            graph.add_node("tool_result", {"name": t_name, "output": t_output})
+                            messages.append({"role": "user", "content": f"[Tool Observation for '{t_name}']: {t_output}. Continue your task."})
+                            continue
+                except json.JSONDecodeError: pass
+
+                db.add(Message(session_id=new_db_session.id, role="assistant", content=accumulated_content))
+                graph.add_node("done", accumulated_content)
+                new_db_session.workflow_graph = graph.nodes
+                
+                yield sse_event("done", "")
+                new_db_session.status = "complete"
+                await db.commit()
+                return
+
+        if exit_reason in ["disconnected", "empty_response", "max_iterations"]:
+            new_db_session.status = "error" if exit_reason != "disconnected" else "cancelled"
+            await db.commit()
+
+    return StreamingResponse(replay_override_generator(), media_type="text/event-stream")
